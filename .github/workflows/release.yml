@@ -25,15 +25,33 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Install cross-compilation tools
-      if: matrix.architecture == 'aarch64'
+    - name: Install build dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        sudo apt-get install -y build-essential
+        if [ "${{ matrix.architecture }}" = "aarch64" ]; then
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+        fi
 
-    - name: Build graftcp (static linking)
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Build all programs
       run: |
-        make CROSS_COMPILE=${{ matrix.cross_compile }} LDFLAGS="-static" clean all
+        # Build C程序 (graftcp) with static linking
+        make CROSS_COMPILE=${{ matrix.cross_compile }} LDFLAGS="-static" graftcp libgraftcp.a
+
+        # Build Go程序 (graftcp-local, mgraftcp) with static linking
+        cd local
+        if [ "${{ matrix.architecture }}" = "aarch64" ]; then
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC=${{ matrix.cross_compile }}gcc CXX=${{ matrix.cross_compile }}g++ AR=${{ matrix.cross_compile }}ar go build -ldflags "-s -w -linkmode external -extldflags '-static' -X main.version=${{ github.ref_name }}" ./cmd/graftcp-local
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC=${{ matrix.cross_compile }}gcc CXX=${{ matrix.cross_compile }}g++ AR=${{ matrix.cross_compile }}ar go build -ldflags "-s -w -linkmode external -extldflags '-static' -X main.version=${{ github.ref_name }}" ./cmd/mgraftcp
+        else
+          CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${{ github.ref_name }}" ./cmd/graftcp-local
+          CGO_ENABLED=1 go build -ldflags "-s -w -linkmode external -extldflags '-static' -X main.version=${{ github.ref_name }}" ./cmd/mgraftcp
+        fi
 
     - name: Create release archive
       run: |

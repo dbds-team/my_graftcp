@@ -31,9 +31,9 @@ Workflow会自动生成以下文件并上传到Release：
 - `graftcp-v1.0.0-linux-arm64.tar.gz` - ARM64架构版本
 
 每个压缩包包含：
-- `graftcp` - 主程序
-- `graftcp-local` - 本地代理
-- `mgraftcp` - 管理工具
+- `graftcp` - 主程序 (C语言，静态链接)
+- `graftcp-local` - 本地代理服务 (Go语言，静态编译)
+- `mgraftcp` - 管理工具 (Go语言，静态链接)
 - `README.md` / `README.zh-CN.md` - 说明文档
 - `COPYING` - 许可证
 - `example-*` - 配置示例
