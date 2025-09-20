@@ -1,0 +1,105 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        architecture: [x86_64, aarch64]
+        include:
+          - architecture: x86_64
+            cross_compile: ""
+            arch_name: "linux-amd64"
+          - architecture: aarch64
+            cross_compile: "aarch64-linux-gnu-"
+            arch_name: "linux-arm64"
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install cross-compilation tools
+      if: matrix.architecture == 'aarch64'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+    - name: Build graftcp
+      run: |
+        make CROSS_COMPILE=${{ matrix.cross_compile }} clean all
+
+    - name: Create release archive
+      run: |
+        mkdir -p release
+        cp graftcp local/graftcp-local local/mgraftcp release/
+        cp README.md README.zh-CN.md COPYING example-*.* release/
+        tar -czf graftcp-${{ github.ref_name }}-${{ matrix.arch_name }}.tar.gz -C release .
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: graftcp-${{ matrix.arch_name }}
+        path: graftcp-${{ github.ref_name }}-${{ matrix.arch_name }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          artifacts/graftcp-linux-amd64/graftcp-${{ github.ref_name }}-linux-amd64.tar.gz
+          artifacts/graftcp-linux-arm64/graftcp-${{ github.ref_name }}-linux-arm64.tar.gz
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sync-to-private:
+    needs: release
+    runs-on: ubuntu-latest
+    if: success()
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+
+    - name: Configure Git
+      run: |
+        git config --global user.name 'GitHub Actions'
+        git config --global user.email 'actions@github.com'
+
+    - name: Add private remote
+      run: |
+        git remote add private git@github.com:dbds-team/my_graftcp.git
+
+    - name: Setup SSH key for private repo
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.PRIVATE_REPO_SSH_KEY }}
+
+    - name: Push to private repo private_build branch
+      run: |
+        git checkout -b private_build
+        git push private private_build --force
