@@ -31,9 +31,9 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-    - name: Build graftcp
+    - name: Build graftcp (static linking)
       run: |
-        make CROSS_COMPILE=${{ matrix.cross_compile }} clean all
+        make CROSS_COMPILE=${{ matrix.cross_compile }} LDFLAGS="-static" clean all
 
     - name: Create release archive
       run: |
@@ -74,32 +74,3 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  sync-to-private:
-    needs: release
-    runs-on: ubuntu-latest
-    if: success()
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-
-    - name: Configure Git
-      run: |
-        git config --global user.name 'GitHub Actions'
-        git config --global user.email 'actions@github.com'
-
-    - name: Add private remote
-      run: |
-        git remote add private git@github.com:dbds-team/my_graftcp.git
-
-    - name: Setup SSH key for private repo
-      uses: webfactory/ssh-agent@v0.9.0
-      with:
-        ssh-private-key: ${{ secrets.PRIVATE_REPO_SSH_KEY }}
-
-    - name: Push to private repo private_build branch
-      run: |
-        git checkout -b private_build
-        git push private private_build --force

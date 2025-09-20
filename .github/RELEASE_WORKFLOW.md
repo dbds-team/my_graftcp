@@ -2,43 +2,16 @@
 
 ## 概述
 
-该workflow在以`v`开头的tag被推送时自动触发，构建多架构版本并创建GitHub Release，同时将代码同步到私有仓库的`private_build`分支。
+该workflow在以`v`开头的tag被推送时自动触发，构建多架构版本并创建GitHub Release。
 
 ## 功能特性
 
 - ✅ 多架构构建 (x86_64, aarch64)
+- ✅ 静态链接构建，无依赖库要求
 - ✅ 自动创建GitHub Release
 - ✅ 生成压缩包并上传到Release
-- ✅ 同步代码到私有仓库指定分支
 - ✅ 使用最新版Actions插件
-
-## 必需的Secrets配置
-
-在GitHub仓库设置中添加以下Secrets：
-
-### 1. PRIVATE_REPO_TOKEN
-- **用途**: 访问私有仓库的权限
-- **类型**: Personal Access Token (Classic)
-- **权限**: 需要 `repo` 完整权限
-- **获取方式**:
-  1. 访问 GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
-  2. 生成新token，选择 `repo` 权限
-  3. 复制token到仓库Secrets
-
-### 2. PRIVATE_REPO_SSH_KEY
-- **用途**: SSH方式推送到私有仓库
-- **类型**: SSH私钥
-- **获取方式**:
-  ```bash
-  # 生成SSH密钥对
-  ssh-keygen -t ed25519 -C "github-actions@yourdomain.com" -f ~/.ssh/private_repo_key
-
-  # 将公钥添加到私有仓库的Deploy Keys
-  cat ~/.ssh/private_repo_key.pub
-
-  # 将私钥内容添加到Secrets
-  cat ~/.ssh/private_repo_key
-  ```
+- ✅ 无需额外配置，开箱即用
 
 ## 使用方法
 
@@ -65,10 +38,6 @@ Workflow会自动生成以下文件并上传到Release：
 - `COPYING` - 许可证
 - `example-*` - 配置示例
 
-### 私有仓库同步
-
-代码会自动推送到 `git@github.com:dbds-team/my_graftcp.git` 的 `private_build` 分支，确保主线仓库从origin更新，私有仓库在独立分支上。
-
 ## Workflow详细说明
 
 ### 构建阶段 (build job)
@@ -83,11 +52,6 @@ Workflow会自动生成以下文件并上传到Release：
 2. **创建Release**: 使用最新的softprops/action-gh-release@v2
 3. **上传文件**: 将所有架构的压缩包上传到Release
 4. **生成说明**: 自动生成Release Notes
-
-### 同步阶段 (sync-to-private job)
-1. **配置SSH**: 使用webfactory/ssh-agent@v0.9.0
-2. **添加远程**: 配置私有仓库remote
-3. **推送代码**: 强制推送到private_build分支
 
 ## 故障排除
 
