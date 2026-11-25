@@ -23,7 +23,7 @@
 
 - 状态：`implemented`
 - 目标/结果：保留旧版平铺 tar.gz 命名，增加官方 deb/rpm/FHS tar.gz，覆盖 amd64/arm64/armv7/386。
-- 技术：从 go.mod 获取 Go 版本；cgo external static link；校验 ELF 架构、静态属性；发布前执行同一 tag 的测试；master push 运行四架构打包但不发布。
+- 技术：从 go.mod 获取 Go 版本；cgo external static link；校验 ELF 架构、静态属性；仅 `v*` tag push 触发同一 commit 的测试、四架构构建与正式发布；普通分支/PR/manual 不触发。
 - 代码：`.github/workflows/{release,release-packages}.yml`、`scripts/build-release-packages.sh`、`build.sh`。
 - 风险：跨平台依赖交叉 GCC/libc；GitHub CI（run 45572784038）已验证完整回归和四架构打包；正式 Release 发布尚未触发。
 - 后续：选定新的 fork 版本号后推送 tag，核对远端 jobs、资产和 SHA256SUMS。
@@ -48,11 +48,12 @@ DNS 测试使用本地 fixture，避免以公网是否可用判断 DNS 重定向
 
 ## Delivery Plan
 
-本地构建/组件测试 -> 四架构静态打包校验 -> 提交推送 master 验证完整 CI -> 按用户发布安排推送 tag。
+本地构建/组件测试 -> 静态检查 workflow -> 提交推送源码（不触发 CI）-> 按用户发布安排推送 tag，执行完整 CI 与发布。
 本地 seccomp 禁止 ptrace，tracer/DNS 端到端与增量构建完整测试交由严格 CI 执行。
 已验证 GitHub 完整测试与四架构 artifacts；未推送新 tag，不宣称 GitHub Release 已发布。
 
 ## Change Log
 
+- 2026-11-25：最终 Node.js 24 CI（run 45573693982）通过；按要求改为仅 `v*` tag push 触发测试、构建与发布，移除所有非 tag 入口。
 - 2026-11-25：GitHub 首轮完整 CI 通过；升级发布相关 Actions 到 Node.js 24，并显式打印 DNS 端到端验证。
 - 2026-11-25：同步官方 `adc54a5`；恢复静态发布兼容，增加 DNS 端到端回归、构建入口及调试日志。

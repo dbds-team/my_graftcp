@@ -1,14 +1,12 @@
 name: Build and Test
 
 on:
-  pull_request:
-  workflow_dispatch:
   workflow_call:
     inputs:
       ref:
-        description: Source ref to validate (the release tag for packaging)
+        description: Commit SHA of the pushed release tag
         type: string
-        default: ''
+        required: true
 
 permissions:
   contents: read
@@ -19,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - uses: actions/setup-go@v7.1.0
         with:

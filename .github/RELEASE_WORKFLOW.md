@@ -12,8 +12,8 @@
 
 ## 自动验证
 
-`.github/workflows/release.yml` 在 PR 和手动触发时执行构建与测试；master push
-及发布由打包 workflow 调用它，验证**同一个待打包 commit/tag**：
+`.github/workflows/release.yml` 仅作为 reusable workflow，由 tag 发布流程调用，
+验证**该 tag 推送时指向的同一个 commit**；不再独立响应 master、PR 或手动触发：
 
 - 按 `local/go.mod` 选择 Go（目前最低为 1.25.0），不再固定旧的 Go 1.21。
 - `./build.sh` 构建统一入口；`make test` 执行 C/Go 回归测试。
@@ -35,12 +35,11 @@ actionlint  # 可选，需预先安装
 ## 发布入口
 
 统一由官方引入的 `.github/workflows/release-packages.yml` 发布，避免两个 workflow
-同时创建 Release。触发方式：
+同时创建 Release。**唯一触发方式：推送 `v*` tag**。
 
-- master push：以 `v0.0.0-dev` 构建四架构 artifacts，**不创建 tag、不发布 Release**；
-- push 一个新的 `v*` tag；
-- 发布 GitHub Release（published）；
-- 手动运行 Release packages，指定已有 tag；`upload_to_release=false` 只构建 artifacts。
+普通分支 push、PR、GitHub Release published 事件和手动操作均不会启动 workflow。
+tag 触发后依次执行完整测试、四架构构建、创建 Release 和上传 assets；前序失败时不发布。
+tag 删除不构建，创建 Release 时使用 `--verify-tag`，不会自动补建 tag。
 
 例如（下一版本号按需要选择，不能重复使用已有 tag）：
 
@@ -49,7 +48,7 @@ git tag v1.1.0
 git push origin v1.1.0
 ```
 
-发布需要该 tag 对应的源码已包含新 workflow。手动构建旧 tag 不会自动升级旧源码。
+发布需要该 tag 对应的源码已包含新 workflow；旧 tag 不会自动升级旧源码。
 这里只配置和验证发布流程；修改工作区不会自动推送 tag 或发布 Release。
 
 ## 产物与兼容性
@@ -114,3 +113,7 @@ ARM64/ARMv7 在 QEMU 下通过版本启动检查，386 在宿主 Linux 内核原
 随后将 checkout/setup-go/upload-artifact/download-artifact 升级到已核验的
 Node.js 24 稳定版本，避免旧 Actions 的 Node.js 20 弃用警告；CI 单独打印 curl DNS
 端到端测试结果，便于直接复核。正式发布未执行，需另行推送新 tag。
+
+最终 [Node.js 24 CI](https://github.com/dbds-team/my_graftcp/actions/runs/45573693982)
+同样全部通过。上述 master 验证属于调整前的临时验证；随后按要求收紧为仅 tag push
+触发，取消 master/PR/manual/release 事件入口与 `v0.0.0-dev` 兜底版本。
