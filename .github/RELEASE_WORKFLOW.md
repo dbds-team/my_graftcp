@@ -103,3 +103,14 @@ PATH="$(cd local && go env GOROOT)/bin:$PATH" \
 当前本地运行环境的 seccomp 禁止 `PTRACE_TRACEME`（errno 1），因此完整 C tracer
 及 curl 端到端测试必须在允许 ptrace 的 GitHub runner 上执行。CI 不会跳过这些测试，
 也不会把权限错误当成功；本地可单独执行无 ptrace 的代理/DNS组件测试与静态打包。
+
+## 已执行的验证（2026-11-25）
+
+合并提交 `cf6a50a` 已推送到 master，[首轮 GitHub CI](https://github.com/dbds-team/my_graftcp/actions/runs/45572784038)
+的完整 C/Go/DNS 测试、增量构建回归与四架构打包/上传全部成功；publish 正确跳过。
+本地也完成四架构静态打包、ELF 检查、Debian 架构标签和 16 个包的 SHA256 校验。
+ARM64/ARMv7 在 QEMU 下通过版本启动检查，386 在宿主 Linux 内核原生执行通过。
+
+随后将 checkout/setup-go/upload-artifact/download-artifact 升级到已核验的
+Node.js 24 稳定版本，避免旧 Actions 的 Node.js 20 弃用警告；CI 单独打印 curl DNS
+端到端测试结果，便于直接复核。正式发布未执行，需另行推送新 tag。

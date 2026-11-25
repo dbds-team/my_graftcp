@@ -17,11 +17,11 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: local/go.mod
           cache-dependency-path: local/go.sum
@@ -33,6 +33,10 @@ jobs:
         run: ./build.sh
       - name: Run C, Go and DNS end-to-end tests
         run: make test
+      - name: Show DNS end-to-end verification
+        run: |
+          GOMODCACHE="$PWD/.gomodcache" GOCACHE="$PWD/local/.cache/go-build" \
+            go -C local test -count=1 -v -run '^TestCurlDNSProxyEndToEnd$' ./cmd/mgraftcp
       - name: Check incremental build configuration
         run: scripts/test-build-config.sh
       - name: Verify CLI compatibility
