@@ -1,6 +1,6 @@
 /*
  * graftcp
- * Copyright (C) 2018, 2021 Hmgle <dustgle@gmail.com>
+ * Copyright (C) 2018, 2021-2026 Hmgle <dustgle@gmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -12,37 +12,276 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
+#include <stdlib.h>
+
 #include "graftcp.h"
 
-struct socket_info *SOCKET_INFO_TAB = NULL;
+struct socket_table {
+	unsigned int refs;
+	unsigned int count;
+	unsigned int cap;
+	struct tracked_socket *sockets;
+};
 
-void add_socket_info(struct socket_info *s)
+/* Shared by the tracked descriptors referring to one UDP socket. */
+struct udp_socket_state {
+	unsigned int refs;
+	bool may_cork;
+};
+
+static void release_udp_socket_state(struct udp_socket_state *udp)
 {
-	HASH_ADD_INT(SOCKET_INFO_TAB, magic_fd, s);
+	if (udp != NULL && --udp->refs == 0)
+		free(udp);
 }
 
-void del_socket_info(struct socket_info *s)
+static int find_tracked_socket_fd(const struct proc_info *pinfp, int fd)
 {
-	HASH_DEL(SOCKET_INFO_TAB, s);
+	unsigned int i;
+
+	if (pinfp == NULL || fd < 0)
+		return -1;
+
+	for (i = 0; i < pinfp->files->count; i++) {
+		if (pinfp->files->sockets[i].fd == fd)
+			return (int)i;
+	}
+	return -1;
 }
 
-struct socket_info *find_socket_info(uint64_t magic_fd)
+static int set_tracked_socket(struct proc_info *pinfp, struct tracked_socket socket)
 {
-	struct socket_info *s;
+	struct tracked_socket *sockets;
+	unsigned int new_cap;
+	int idx = find_tracked_socket_fd(pinfp, socket.fd);
 
-	HASH_FIND_INT(SOCKET_INFO_TAB, &magic_fd, s);
-	return s;
+	if (idx < 0) {
+		if (pinfp->files->count >= pinfp->files->cap) {
+			new_cap = pinfp->files->cap ?
+				  pinfp->files->cap * 2 : TRACKED_SOCKET_INITIAL_CAP;
+			sockets = realloc(pinfp->files->sockets,
+					  new_cap * sizeof(*pinfp->files->sockets));
+			if (sockets == NULL)
+				return -1;
+			pinfp->files->sockets = sockets;
+			pinfp->files->cap = new_cap;
+		}
+		idx = pinfp->files->count++;
+		pinfp->files->sockets[idx].udp = NULL;
+	}
+	if (socket.udp != NULL)
+		socket.udp->refs++;
+	release_udp_socket_state(pinfp->files->sockets[idx].udp);
+	pinfp->files->sockets[idx] = socket;
+	return 0;
 }
 
-struct proc_info *PROC_INFO_TAB = NULL;
-
-void add_proc_info(struct proc_info *p)
+int track_socket_fd(struct proc_info *pinfp, int fd, int domain, int type)
 {
-	HASH_ADD_INT(PROC_INFO_TAB, pid, p);
+	struct tracked_socket socket = {.fd = fd, .domain = domain, .type = type};
+
+	if (pinfp == NULL || fd < 0)
+		return -1;
+	if ((type & SOCK_TYPE_MASK) == SOCK_DGRAM) {
+		socket.udp = calloc(1, sizeof(*socket.udp));
+		if (socket.udp == NULL)
+			return -1;
+	}
+	if (set_tracked_socket(pinfp, socket) < 0) {
+		free(socket.udp);
+		return -1;
+	}
+	return 0;
 }
 
-void del_proc_info(struct proc_info *p)
+int copy_tracked_socket_fd(struct proc_info *dst, const struct proc_info *src,
+			   int oldfd, int newfd)
 {
+	struct tracked_socket socket;
+	int idx;
+
+	if (dst == NULL || src == NULL || oldfd < 0 || newfd < 0)
+		return -1;
+	idx = find_tracked_socket_fd(src, oldfd);
+	if (idx < 0)
+		return 0;
+	socket = src->files->sockets[idx];
+	socket.fd = newfd;
+	return set_tracked_socket(dst, socket);
+}
+
+bool is_tracked_socket_fd(struct proc_info *pinfp, int fd)
+{
+	return find_tracked_socket_fd(pinfp, fd) >= 0;
+}
+
+static bool is_tracked_socket_type(struct proc_info *pinfp, int fd, int type)
+{
+	int idx = find_tracked_socket_fd(pinfp, fd);
+
+	if (idx < 0)
+		return false;
+	return (pinfp->files->sockets[idx].type & SOCK_TYPE_MASK) == type;
+}
+
+bool is_tracked_stream_socket_fd(struct proc_info *pinfp, int fd)
+{
+	return is_tracked_socket_type(pinfp, fd, SOCK_STREAM);
+}
+
+bool is_tracked_dgram_socket_fd(struct proc_info *pinfp, int fd)
+{
+	return is_tracked_socket_type(pinfp, fd, SOCK_DGRAM);
+}
+
+void mark_socket_may_cork(struct proc_info *pinfp, int fd)
+{
+	int idx = find_tracked_socket_fd(pinfp, fd);
+
+	if (idx >= 0 && pinfp->files->sockets[idx].udp != NULL)
+		pinfp->files->sockets[idx].udp->may_cork = true;
+}
+
+bool socket_may_cork(struct proc_info *pinfp, int fd)
+{
+	int idx = find_tracked_socket_fd(pinfp, fd);
+
+	return idx >= 0 && pinfp->files->sockets[idx].udp != NULL &&
+	       pinfp->files->sockets[idx].udp->may_cork;
+}
+
+static void untrack_socket_at(struct socket_table *files, unsigned int idx)
+{
+	release_udp_socket_state(files->sockets[idx].udp);
+	files->sockets[idx] = files->sockets[--files->count];
+}
+
+void untrack_socket_fd(struct proc_info *pinfp, int fd)
+{
+	int idx = find_tracked_socket_fd(pinfp, fd);
+
+	if (idx >= 0)
+		untrack_socket_at(pinfp->files, idx);
+}
+
+static void release_socket_table(struct socket_table *files)
+{
+	if (--files->refs != 0)
+		return;
+	for (unsigned int i = 0; i < files->count; i++)
+		release_udp_socket_state(files->sockets[i].udp);
+	free(files->sockets);
+	free(files);
+}
+
+static struct socket_table *clone_socket_table(const struct socket_table *src)
+{
+	struct socket_table *files = calloc(1, sizeof(*files));
+
+	if (files == NULL)
+		return NULL;
+	if (src->count != 0) {
+		size_t size = src->count * sizeof(*files->sockets);
+
+		files->sockets = malloc(size);
+		if (!files->sockets) {
+			free(files);
+			return NULL;
+		}
+		memcpy(files->sockets, src->sockets, size);
+		for (unsigned int i = 0; i < src->count; i++) {
+			if (files->sockets[i].udp != NULL)
+				files->sockets[i].udp->refs++;
+		}
+	}
+	files->count = files->cap = src->count;
+	files->refs = 1;
+	return files;
+}
+
+int copy_tracked_sockets(struct proc_info *dst, const struct proc_info *src)
+{
+	struct socket_table *files;
+
+	if (dst == NULL || src == NULL)
+		return -1;
+	files = clone_socket_table(src->files);
+	if (files == NULL)
+		return -1;
+	release_socket_table(dst->files);
+	dst->files = files;
+	return 0;
+}
+
+void share_tracked_sockets(struct proc_info *dst, const struct proc_info *src)
+{
+	++src->files->refs;
+	release_socket_table(dst->files);
+	dst->files = src->files;
+}
+
+int unshare_tracked_sockets(struct proc_info *p)
+{
+	if (p->files->refs == 1)
+		return 0;
+	return copy_tracked_sockets(p, p);
+}
+
+void set_socket_cloexec(struct proc_info *p, int fd, bool enabled)
+{
+	int idx = find_tracked_socket_fd(p, fd);
+
+	if (idx < 0)
+		return;
+	p->files->sockets[idx].type &= ~SOCK_CLOEXEC;
+	if (enabled)
+		p->files->sockets[idx].type |= SOCK_CLOEXEC;
+}
+
+void close_tracked_range(struct proc_info *p, unsigned int first,
+			 unsigned int last, bool cloexec)
+{
+	unsigned int i = 0;
+
+	while (i < p->files->count) {
+		struct tracked_socket *sock = &p->files->sockets[i];
+
+		if ((unsigned int)sock->fd < first || (unsigned int)sock->fd > last) {
+			++i;
+		} else if (cloexec) {
+			sock->type |= SOCK_CLOEXEC;
+			++i;
+		} else {
+			untrack_socket_at(p->files, i);
+		}
+	}
+}
+
+void close_exec_sockets(struct proc_info *p)
+{
+	unsigned int i = 0;
+
+	while (i < p->files->count) {
+		if (p->files->sockets[i].type & SOCK_CLOEXEC)
+			untrack_socket_at(p->files, i);
+		else
+			++i;
+	}
+}
+
+static struct proc_info *PROC_INFO_TAB;
+
+static void add_proc_info(struct proc_info *p)
+{
+	if (p == NULL)
+		return;
+	HASH_ADD(hh, PROC_INFO_TAB, pid, sizeof(p->pid), p);
+}
+
+static void del_proc_info(struct proc_info *p)
+{
+	if (p == NULL)
+		return;
 	HASH_DEL(PROC_INFO_TAB, p);
 }
 
@@ -50,335 +289,32 @@ struct proc_info *find_proc_info(pid_t pid)
 {
 	struct proc_info *p;
 
-	HASH_FIND_INT(PROC_INFO_TAB, &pid, p);
+	HASH_FIND(hh, PROC_INFO_TAB, &pid, sizeof(pid), p);
 	return p;
 }
 
 struct proc_info *alloc_proc_info(pid_t pid)
 {
 	struct proc_info *newp = calloc(1, sizeof(*newp));
+
+	if (newp == NULL)
+		return NULL;
+	newp->files = calloc(1, sizeof(*newp->files));
+	if (newp->files == NULL) {
+		free(newp);
+		return NULL;
+	}
+	newp->files->refs = 1;
 	newp->pid = pid;
 	add_proc_info(newp);
 	return newp;
 }
 
-#ifndef offsetof
-#define offsetof(a, b) __builtin_offsetof(a,b)
-#endif
-
-#if defined(__arm64__) || defined(__aarch64__)
-struct arm_pt_regs {
-	uint32_t uregs[18];
-};
-#define ARM_cpsr	uregs[16]
-#define ARM_pc		uregs[15]
-#define ARM_lr		uregs[14]
-#define ARM_sp		uregs[13]
-#define ARM_ip		uregs[12]
-#define ARM_fp		uregs[11]
-#define ARM_r10		uregs[10]
-#define ARM_r9		uregs[9]
-#define ARM_r8		uregs[8]
-#define ARM_r7		uregs[7]
-#define ARM_r6		uregs[6]
-#define ARM_r5		uregs[5]
-#define ARM_r4		uregs[4]
-#define ARM_r3		uregs[3]
-#define ARM_r2		uregs[2]
-#define ARM_r1		uregs[1]
-#define ARM_r0		uregs[0]
-#define ARM_ORIG_r0	uregs[17]
-
-static union {
-	struct user_pt_regs aarch64_r;
-	struct arm_pt_regs  arm_r;
-} arm_regs_union;
-#endif
-
-int get_syscall_number(pid_t pid)
+void free_proc_info(struct proc_info *p)
 {
-#if defined(__x86_64__)
-#if 1
-	errno = 0;
-	int offset = offsetof(struct user, regs.orig_rax);
-	long val = ptrace(PTRACE_PEEKUSER, pid, offset);
-	assert(errno == 0);
-	return (int)val;
-#else			/* another way */
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	assert(errno == 0);
-	return regs.orig_rax;
-#endif
-#elif defined(__i386__)
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	assert(errno == 0);
-	return regs.orig_eax;
-#elif defined(__arm__)
-	errno = 0;
-	struct pt_regs regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	assert(errno == 0);
-	return regs.ARM_r7;
-#elif defined(__arm64__) || defined(__aarch64__)
-	struct iovec iov = {
-		.iov_base = &arm_regs_union,
-		.iov_len = sizeof(struct user_pt_regs)
-	};
-	ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-	assert(errno == 0);
-	switch (iov.iov_len) {
-	case sizeof(struct user_pt_regs):
-		return arm_regs_union.aarch64_r.regs[8];
-	case sizeof(struct arm_pt_regs):
-		return arm_regs_union.arm_r.ARM_r7;
-	}
-	return -1;
-#endif
-}
-
-int get_retval(pid_t pid)
-{
-#if defined(__x86_64__)
-#if 1
-	errno = 0;
-	int offset = offsetof(struct user, regs.rax);
-	long val = ptrace(PTRACE_PEEKUSER, pid, offset);
-	return (int)val;
-#else			/* another way */
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	return regs.rax;
-#endif
-#elif defined(__i386__)
-	errno = 0;
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	return regs.eax;
-#elif defined(__arm__)
-	errno = 0;
-	struct pt_regs regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	return regs.ARM_r0;
-#elif defined(__arm64__) || defined(__aarch64__)
-	struct iovec iov = {
-		.iov_base = &arm_regs_union,
-		.iov_len = sizeof(struct user_pt_regs)
-	};
-	ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-	assert(errno == 0);
-	switch (iov.iov_len) {
-	case sizeof(struct user_pt_regs):
-		return arm_regs_union.aarch64_r.regs[0];
-	case sizeof(struct arm_pt_regs):
-		return arm_regs_union.arm_r.ARM_r0;
-	}
-	return -1;
-#endif
-}
-
-void set_retval(pid_t pid, long new_val)
-{
-#if defined(__x86_64__)
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	assert(errno == 0);
-	if ((long)regs.rax == new_val)
+	if (p == NULL)
 		return;
-	regs.rax = new_val;
-	ptrace(PTRACE_SETREGS, pid, 0, &regs);
-	assert(errno == 0);
-#elif defined(__i386__)
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	assert(errno == 0);
-	if ((long)regs.eax == new_val)
-		return;
-	regs.eax = new_val;
-	ptrace(PTRACE_SETREGS, pid, 0, &regs);
-	assert(errno == 0);
-#elif defined(__arm__)
-	struct pt_regs regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	assert(errno == 0);
-	if ((long)regs.ARM_r0 == new_val)
-		return;
-	regs.ARM_r0 = new_val;
-	ptrace(PTRACE_SETREGS, pid, 0, &regs);
-	assert(errno == 0);
-#elif defined(__arm64__) || defined(__aarch64__)
-	struct iovec iov = {
-		.iov_base = &arm_regs_union,
-		.iov_len = sizeof(struct user_pt_regs)
-	};
-	ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov);
-	assert(errno == 0);
-	switch (iov.iov_len) {
-	case sizeof(struct user_pt_regs):
-		arm_regs_union.aarch64_r.regs[0] = new_val;
-	case sizeof(struct arm_pt_regs):
-		arm_regs_union.arm_r.ARM_r0 = new_val;
-	}
-	ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov);
-	assert(errno == 0);
-#endif
-}
-
-long get_syscall_arg(pid_t pid, int order)
-{
-	long val;
-#if defined(__x86_64__)
-	int offset;
-
-	switch (order) {
-	case 0:
-		offset = offsetof(struct user, regs.rdi);
-		break;
-	case 1:
-		offset = offsetof(struct user, regs.rsi);
-		break;
-	case 2:
-		offset = offsetof(struct user, regs.rdx);
-		break;
-	case 3:
-		offset = offsetof(struct user, regs.r10);
-		break;
-	case 4:
-		offset = offsetof(struct user, regs.r8);
-		break;
-	case 5:
-		offset = offsetof(struct user, regs.r9);
-		break;
-	default:
-		return -1;
-	}
-	errno = 0;
-	val = ptrace(PTRACE_PEEKUSER, pid, offset);
-	assert(errno == 0);
-#elif defined(__i386__)
-	struct user_regs_struct regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	switch (order) {
-	case 0:
-		val = regs.ebx;
-		break;
-	case 1:
-		val = regs.ecx;
-		break;
-	case 2:
-		val = regs.edx;
-		break;
-	case 3:
-		val = regs.esi;
-		break;
-	case 4:
-		val = regs.edi;
-		break;
-	case 5:
-		val = regs.ebp;
-		break;
-	default:
-		return -1;
-	}
-#elif defined(__arm__)
-	struct pt_regs regs;
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
-	switch (order) {
-	case 0:
-		val = regs.ARM_ORIG_r0;
-		break;
-	case 1:
-		val = regs.ARM_r1;
-		break;
-	case 2:
-		val = regs.ARM_r2;
-		break;
-	case 3:
-		val = regs.ARM_r3;
-		break;
-	case 4:
-		val = regs.ARM_r4;
-		break;
-	case 5:
-		val = regs.ARM_r5;
-		break;
-	default:
-		return -1;
-	}
-#elif defined(__arm64__) || defined(__aarch64__)
-	switch (order) {
-	case 0:
-		val = arm_regs_union.aarch64_r.regs[0];
-		break;
-	case 1:
-		val = arm_regs_union.aarch64_r.regs[1];
-		break;
-	case 2:
-		val = arm_regs_union.aarch64_r.regs[2];
-		break;
-	case 3:
-		val = arm_regs_union.aarch64_r.regs[3];
-		break;
-	case 4:
-		val = arm_regs_union.aarch64_r.regs[4];
-		break;
-	case 5:
-		val = arm_regs_union.aarch64_r.regs[5];
-		break;
-	default:
-		return -1;
-	}
-#endif
-	return val;
-}
-
-void getdata(pid_t child, long addr, char *dst, int len)
-{
-	char *laddr;
-	int i, j;
-	union u {
-		long val;
-		char chars[sizeof(long)];
-	} data;
-
-	i = 0;
-	j = len / sizeof(long);
-	laddr = dst;
-	while (i < j) {
-		data.val = ptrace(PTRACE_PEEKDATA, child, addr + i * 8, NULL);
-		memcpy(laddr, data.chars, sizeof(long));
-		++i;
-		laddr += sizeof(long);
-	}
-	j = len % sizeof(long);
-	if (j != 0) {
-		data.val = ptrace(PTRACE_PEEKDATA, child, addr + i * 8, NULL);
-		memcpy(laddr, data.chars, j);
-	}
-}
-
-void putdata(pid_t child, long addr, char *src, int len)
-{
-	char *laddr;
-	int i, j;
-	union u {
-		long val;
-		char chars[sizeof(long)];
-	} data;
-
-	i = 0;
-	j = len / sizeof(long);
-	laddr = src;
-	while (i < j) {
-		memcpy(data.chars, laddr, sizeof(long));
-		ptrace(PTRACE_POKEDATA, child, addr + i * 8, data.val);
-		++i;
-		laddr += sizeof(long);
-	}
-	j = len % sizeof(long);
-	if (j != 0) {
-		memcpy(data.chars, laddr, j);
-		ptrace(PTRACE_POKEDATA, child, addr + i * 8, data.val);
-	}
+	del_proc_info(p);
+	release_socket_table(p->files);
+	free(p);
 }

@@ -1,0 +1,451 @@
+package local
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sync"
+	"time"
+
+	"golang.org/x/net/ipv4"
+)
+
+const (
+	udpPacketMaxSize     = 65535
+	udpPacketConcurrency = 1024
+	udpSessionIdle       = 2 * time.Minute
+	udpSessionGCPeriod   = 30 * time.Second
+	udpSessionReadLimit  = 30 * time.Second
+)
+
+type udpForwarder interface {
+	Write([]byte) error
+	Close() error
+}
+
+type udpSessionKey struct {
+	client netip.AddrPort
+	token  uint32
+	// The registry can reuse an expired token for another destination.
+	destAddr string
+}
+
+type udpSession struct {
+	key        udpSessionKey
+	clientAddr *net.UDPAddr
+	tokenIP    net.IP
+	destAddr   string
+	forwarder  udpForwarder
+	ready      chan struct{}
+	initErr    error
+	lastSeen   time.Time
+}
+
+// UDPProxy forwards local UDP packets to their registered destinations.
+type UDPProxy struct {
+	local *Local
+
+	conn       *net.UDPConn
+	packetConn *ipv4.PacketConn
+
+	startOnce sync.Once
+	closeOnce sync.Once
+	mu        sync.Mutex
+	sessions  map[udpSessionKey]*udpSession
+	closed    chan struct{}
+	packetSem chan struct{}
+}
+
+// ListenUDPProxy binds a generic UDP listener for token-routed datagrams.
+func (l *Local) ListenUDPProxy() (*UDPProxy, int, error) {
+	udp4, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		return nil, 0, fmt.Errorf("listen UDP proxy: %w", err)
+	}
+	packetConn := ipv4.NewPacketConn(udp4)
+	if err := packetConn.SetControlMessage(ipv4.FlagDst, true); err != nil {
+		_ = udp4.Close()
+		return nil, 0, fmt.Errorf("enable UDP destination control message: %w", err)
+	}
+	p := &UDPProxy{
+		local:      l,
+		conn:       udp4,
+		packetConn: packetConn,
+		sessions:   make(map[udpSessionKey]*udpSession),
+		closed:     make(chan struct{}),
+		packetSem:  make(chan struct{}, udpPacketConcurrency),
+	}
+
+	port := udp4.LocalAddr().(*net.UDPAddr).Port
+	return p, port, nil
+}
+
+// StartUDPProxy starts a generic UDP listener for token-routed datagrams.
+func (l *Local) StartUDPProxy() (*UDPProxy, int, error) {
+	p, port, err := l.ListenUDPProxy()
+	if err != nil {
+		return nil, 0, err
+	}
+	p.Start()
+	return p, port, nil
+}
+
+// Start serves packets on a listener that was already bound by ListenUDPProxy.
+func (p *UDPProxy) Start() {
+	if p == nil {
+		return
+	}
+	p.startOnce.Do(func() {
+		go p.serve()
+		go p.gcLoop()
+		port := p.conn.LocalAddr().(*net.UDPAddr).Port
+		log.Infof("graftcp UDP proxy started on 0.0.0.0:%d", port)
+	})
+}
+
+func (p *UDPProxy) Close() error {
+	if p == nil {
+		return nil
+	}
+
+	var closeErr error
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		close(p.closed)
+		sessions := p.sessions
+		p.sessions = nil
+		p.mu.Unlock()
+
+		for _, session := range sessions {
+			if session.forwarder != nil {
+				if err := session.forwarder.Close(); err != nil && closeErr == nil {
+					closeErr = err
+				}
+			}
+		}
+		if err := p.conn.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	})
+	return closeErr
+}
+
+func (p *UDPProxy) serve() {
+	buf := make([]byte, udpPacketMaxSize)
+	for {
+		n, cm, src, err := p.packetConn.ReadFrom(buf)
+		if err != nil {
+			if !errors.Is(err, net.ErrClosed) {
+				log.Errorf("UDP proxy read err: %s", err.Error())
+			}
+			return
+		}
+		clientAddr, ok := src.(*net.UDPAddr)
+		if !ok {
+			log.Errorf("UDP proxy received packet from unsupported addr %v", src)
+			continue
+		}
+		if cm == nil || cm.Dst == nil {
+			log.Errorf("UDP proxy missing destination address for %s", clientAddr.String())
+			continue
+		}
+		tokenIP := cm.Dst.To4()
+		if tokenIP == nil {
+			log.Errorf("UDP proxy got non-IPv4 destination %s", cm.Dst.String())
+			continue
+		}
+		if !isManagedLoopbackToken(tokenIP) {
+			log.Debugf("UDP proxy ignoring packet for non-token destination %s from %s",
+				tokenIP.String(), clientAddr.String())
+			continue
+		}
+		select {
+		case p.packetSem <- struct{}{}:
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+			clientAddr = cloneUDPAddr(clientAddr)
+			tokenIP = cloneIP(tokenIP)
+			go func() {
+				defer func() { <-p.packetSem }()
+				p.handlePacket(clientAddr, tokenIP, payload)
+			}()
+		default:
+			log.Warnf("UDP proxy dropping packet for %s from %s: handlers busy",
+				tokenIP.String(), clientAddr.String())
+		}
+	}
+}
+
+func (p *UDPProxy) handlePacket(clientAddr *net.UDPAddr, tokenIP net.IP, payload []byte) {
+	destAddr, ok := p.local.udpRoutes.Lookup(tokenIP)
+	if !ok {
+		log.Errorf("UDP proxy route lookup failed for token %s from %s", tokenIP.String(), clientAddr.String())
+		return
+	}
+
+	session, err := p.getSession(clientAddr, tokenIP, destAddr)
+	if err != nil {
+		if !errors.Is(err, net.ErrClosed) {
+			log.Errorf("UDP proxy session for %s -> %s err: %s", clientAddr.String(), destAddr, err.Error())
+		}
+		return
+	}
+	select {
+	case <-session.ready:
+	case <-p.closed:
+		return
+	}
+	if session.initErr != nil {
+		log.Errorf("UDP proxy session for %s -> %s err: %s", clientAddr.String(), destAddr, session.initErr.Error())
+		return
+	}
+	if session.forwarder == nil {
+		log.Errorf("UDP proxy session for %s -> %s has no forwarder", clientAddr.String(), destAddr)
+		return
+	}
+	if err := session.forwarder.Write(payload); err != nil {
+		log.Errorf("UDP proxy write for %s -> %s err: %s", clientAddr.String(), destAddr, err.Error())
+		p.removeSession(session)
+	}
+}
+
+func (p *UDPProxy) getSession(clientAddr *net.UDPAddr, tokenIP net.IP, destAddr string) (*udpSession, error) {
+	key := makeUDPSessionKey(clientAddr, tokenIP, destAddr)
+	now := time.Now()
+
+	p.mu.Lock()
+	select {
+	case <-p.closed:
+		p.mu.Unlock()
+		return nil, net.ErrClosed
+	default:
+	}
+	if session, ok := p.sessions[key]; ok {
+		session.lastSeen = now
+		p.mu.Unlock()
+		return session, nil
+	}
+	session := &udpSession{
+		key:        key,
+		clientAddr: cloneUDPAddr(clientAddr),
+		tokenIP:    cloneIP(tokenIP),
+		destAddr:   destAddr,
+		ready:      make(chan struct{}),
+		lastSeen:   now,
+	}
+	p.sessions[key] = session
+	p.mu.Unlock()
+
+	go p.initSession(session)
+	return session, nil
+}
+
+func (p *UDPProxy) initSession(session *udpSession) {
+	defer close(session.ready)
+	select {
+	case <-p.closed:
+		return
+	default:
+	}
+	forwarder, err := p.local.newUDPForwarder(p, session.clientAddr, session.tokenIP, session.destAddr)
+
+	p.mu.Lock()
+	current := p.sessions[session.key] == session
+	if current {
+		session.forwarder = forwarder
+		session.initErr = err
+	}
+	p.mu.Unlock()
+
+	if !current {
+		if forwarder != nil {
+			_ = forwarder.Close()
+		}
+		return
+	}
+
+	if err != nil {
+		p.removeSession(session)
+	}
+}
+
+func (p *UDPProxy) sendToClient(payload []byte, tokenIP net.IP, clientAddr *net.UDPAddr) error {
+	cm := &ipv4.ControlMessage{Src: tokenIP.To4()}
+	_, err := p.packetConn.WriteTo(payload, cm, clientAddr)
+	return err
+}
+
+func (p *UDPProxy) removeSession(session *udpSession) {
+	p.mu.Lock()
+	if p.sessions[session.key] != session {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.sessions, session.key)
+	p.mu.Unlock()
+	if session.forwarder != nil {
+		_ = session.forwarder.Close()
+	}
+}
+
+func (p *UDPProxy) gcLoop() {
+	ticker := time.NewTicker(udpSessionGCPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.closeIdleSessions(time.Now())
+		case <-p.closed:
+			return
+		}
+	}
+}
+
+func (p *UDPProxy) closeIdleSessions(now time.Time) {
+	var expired []*udpSession
+
+	p.mu.Lock()
+	for key, session := range p.sessions {
+		if now.Sub(session.lastSeen) > udpSessionIdle {
+			delete(p.sessions, key)
+			expired = append(expired, session)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, session := range expired {
+		log.Infof("UDP proxy session idle timeout: %s -> %s", session.clientAddr.String(), session.destAddr)
+		if session.forwarder != nil {
+			_ = session.forwarder.Close()
+		}
+	}
+	p.local.udpRoutes.SweepIdle(now, udpSessionIdle)
+}
+
+func (l *Local) newUDPForwarder(proxy *UDPProxy, clientAddr *net.UDPAddr, tokenIP net.IP, destAddr string) (udpForwarder, error) {
+	switch l.selectMode {
+	case OnlyHTTPProxyMode:
+		return nil, fmt.Errorf("HTTP proxy mode does not support UDP")
+	case DirectMode:
+		return newDirectUDPForwarder(proxy, clientAddr, tokenIP, destAddr)
+	case OnlySocks5Mode:
+		return l.newSocks5UDPForwarder(proxy, clientAddr, tokenIP, destAddr)
+	default:
+		if l.socks5Addr != "" {
+			forwarder, err := l.newSocks5UDPForwarder(proxy, clientAddr, tokenIP, destAddr)
+			if err == nil {
+				return forwarder, nil
+			}
+			log.Infof("SOCKS5 UDP associate failed for %s, fallback direct: %s", destAddr, err.Error())
+		}
+		return newDirectUDPForwarder(proxy, clientAddr, tokenIP, destAddr)
+	}
+}
+
+type directUDPForwarder struct {
+	proxy      *UDPProxy
+	clientAddr *net.UDPAddr
+	tokenIP    net.IP
+	conn       *net.UDPConn
+
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func newDirectUDPForwarder(proxy *UDPProxy, clientAddr *net.UDPAddr, tokenIP net.IP, destAddr string) (udpForwarder, error) {
+	destUDPAddr, err := net.ResolveUDPAddr("udp", destAddr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve UDP destination %q: %w", destAddr, err)
+	}
+	conn, err := net.DialUDP("udp", nil, destUDPAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dial UDP destination %q: %w", destAddr, err)
+	}
+	f := &directUDPForwarder{
+		proxy:      proxy,
+		clientAddr: cloneUDPAddr(clientAddr),
+		tokenIP:    cloneIP(tokenIP),
+		conn:       conn,
+		closed:     make(chan struct{}),
+	}
+	go f.readLoop()
+	return f, nil
+}
+
+func (f *directUDPForwarder) Write(payload []byte) error {
+	_, err := f.conn.Write(payload)
+	return err
+}
+
+func (f *directUDPForwarder) Close() error {
+	var err error
+	f.closeOnce.Do(func() {
+		close(f.closed)
+		err = f.conn.Close()
+	})
+	return err
+}
+
+func (f *directUDPForwarder) readLoop() {
+	buf := make([]byte, udpPacketMaxSize)
+	for {
+		select {
+		case <-f.closed:
+			return
+		default:
+		}
+		if err := f.conn.SetReadDeadline(time.Now().Add(udpSessionReadLimit)); err != nil {
+			return
+		}
+		n, err := f.conn.Read(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			if !errors.Is(err, net.ErrClosed) {
+				log.Errorf("UDP direct read err: %s", err.Error())
+			}
+			return
+		}
+		if err := f.proxy.sendToClient(buf[:n], f.tokenIP, f.clientAddr); err != nil {
+			log.Errorf("UDP proxy response write to %s err: %s", f.clientAddr.String(), err.Error())
+			return
+		}
+	}
+}
+
+func makeUDPSessionKey(clientAddr *net.UDPAddr, tokenIP net.IP, destAddr string) udpSessionKey {
+	client := clientAddr.AddrPort()
+	token, _ := ipToToken(tokenIP)
+	return udpSessionKey{
+		client:   netip.AddrPortFrom(client.Addr().Unmap(), client.Port()),
+		token:    token,
+		destAddr: destAddr,
+	}
+}
+
+func isManagedLoopbackToken(ip net.IP) bool {
+	token, ok := ipToToken(ip)
+	return ok && token >= loopbackStartToken && token <= loopbackEndToken
+}
+
+func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	return &net.UDPAddr{
+		IP:   cloneIP(addr.IP),
+		Port: addr.Port,
+		Zone: addr.Zone,
+	}
+}
+
+func cloneIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	out := make(net.IP, len(ip))
+	copy(out, ip)
+	return out
+}

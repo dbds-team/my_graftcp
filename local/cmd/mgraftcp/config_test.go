@@ -1,0 +1,310 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func TestConfigDNSOptions(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.dnsProxy {
+		t.Fatal("defaultConfig() enabled DNS proxy")
+	}
+	if cfg.dnsServer != "1.1.1.1:53" {
+		t.Fatalf("default dnsServer = %q, want %q", cfg.dnsServer, "1.1.1.1:53")
+	}
+
+	if got := cfg.set("dns_proxy", "true"); got != configSetApplied {
+		t.Fatalf("set(dns_proxy) = %v, want configSetApplied", got)
+	}
+	if got := cfg.set("dns_server", "8.8.8.8:53"); got != configSetApplied {
+		t.Fatalf("set(dns_server) = %v, want configSetApplied", got)
+	}
+	if !cfg.dnsProxy {
+		t.Fatal("dns_proxy=true did not enable DNS proxy")
+	}
+	if cfg.dnsServer != "8.8.8.8:53" {
+		t.Fatalf("dnsServer = %q, want %q", cfg.dnsServer, "8.8.8.8:53")
+	}
+}
+
+func TestConfigUDPOptions(t *testing.T) {
+	cfg := defaultConfig()
+
+	if cfg.udpProxy {
+		t.Fatal("defaultConfig() enabled UDP proxy")
+	}
+	if got := cfg.set("udp_proxy", "true"); got != configSetApplied {
+		t.Fatalf("set(udp_proxy) = %v, want configSetApplied", got)
+	}
+	if !cfg.udpProxy {
+		t.Fatal("udp_proxy=true did not enable UDP proxy")
+	}
+}
+
+func TestDNSConfigFlagOverrides(t *testing.T) {
+	cases := []struct {
+		name    string
+		flagset map[string]bool
+		keys    []string
+	}{
+		{
+			name:    "enable dns",
+			flagset: map[string]bool{"enable-dns": true},
+			keys:    []string{"dns_proxy", "enable_dns", "enable-dns"},
+		},
+		{
+			name:    "disable dns",
+			flagset: map[string]bool{"disable-dns": true},
+			keys:    []string{"dns_proxy", "enable_dns", "enable-dns"},
+		},
+		{
+			name:    "dns server",
+			flagset: map[string]bool{"dns-server": true},
+			keys:    []string{"dns_server", "dns-server"},
+		},
+		{
+			name:    "enable udp",
+			flagset: map[string]bool{"enable-udp": true},
+			keys:    []string{"udp_proxy", "enable_udp", "enable-udp"},
+		},
+		{
+			name:    "disable udp",
+			flagset: map[string]bool{"disable-udp": true},
+			keys:    []string{"udp_proxy", "enable_udp", "enable-udp"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range tc.keys {
+				if !configKeyOverriddenByFlag(tc.flagset, key) {
+					t.Fatalf("%v did not override %s config", tc.flagset, key)
+				}
+			}
+		})
+	}
+}
+
+func TestClientArgsIncludesProxyPortsWhenEnabled(t *testing.T) {
+	oldArgs := os.Args
+	os.Args = []string{"graftcp"}
+	defer func() { os.Args = oldArgs }()
+
+	cfg := defaultConfig()
+	cfg.dnsProxy = true
+	cfg.udpProxy = true
+
+	got := cfg.clientArgs(2233, 5353, 5354, []string{"curl", "example.com"})
+	want := []string{"graftcp", "-p", "2233", "--dns-port", "5353", "--udp-port", "5354", "curl", "example.com"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("clientArgs() = %v, want %v", got, want)
+	}
+}
+
+func TestParseConfigFileLoadsValues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mgraftcp.conf")
+	body := "" +
+		"# comment line\n" +
+		"socks5 = 10.0.0.1:1080\n" +
+		"socks5_username=alice\n" +
+		"socks5_password=secret\n" +
+		"enable-dns = true\n" +
+		"dns_server = 9.9.9.9:53\n" +
+		"enable_udp= 1\n" +
+		"http_proxy =127.0.0.1:8080\n" +
+		"select_proxy_mode= only_socks5\n" +
+		"not_ignore_local=on\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := defaultConfig()
+	if err := cfg.parseConfigFile(path); err != nil {
+		t.Fatalf("parseConfigFile() error = %v", err)
+	}
+	if cfg.socks5Addr != "10.0.0.1:1080" {
+		t.Fatalf("socks5Addr = %q", cfg.socks5Addr)
+	}
+	if cfg.socks5User != "alice" || cfg.socks5Pwd != "secret" {
+		t.Fatalf("socks5 user/pwd = %q/%q", cfg.socks5User, cfg.socks5Pwd)
+	}
+	if !cfg.dnsProxy || cfg.dnsServer != "9.9.9.9:53" {
+		t.Fatalf("dns config not loaded: dnsProxy=%v dnsServer=%q", cfg.dnsProxy, cfg.dnsServer)
+	}
+	if !cfg.udpProxy {
+		t.Fatal("udpProxy not loaded")
+	}
+	if cfg.httpProxyAddr != "127.0.0.1:8080" {
+		t.Fatalf("httpProxyAddr = %q", cfg.httpProxyAddr)
+	}
+	if cfg.selectProxyMode != "only_socks5" {
+		t.Fatalf("selectProxyMode = %q", cfg.selectProxyMode)
+	}
+	if !cfg.notIgnoreLocal {
+		t.Fatal("notIgnoreLocal not loaded")
+	}
+}
+
+func TestParseConfigFileTrailingNewlineDoesNotDoubleParse(t *testing.T) {
+	dir := t.TempDir()
+	with := filepath.Join(dir, "with.conf")
+	without := filepath.Join(dir, "without.conf")
+	if err := os.WriteFile(with, []byte("dns_server = 1.0.0.1:53\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.WriteFile(without, []byte("dns_server = 1.0.0.1:53"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	for _, p := range []string{with, without} {
+		cfg := defaultConfig()
+		if err := cfg.parseConfigFile(p); err != nil {
+			t.Fatalf("parseConfigFile(%s) error = %v", p, err)
+		}
+		if cfg.dnsServer != "1.0.0.1:53" {
+			t.Fatalf("parseConfigFile(%s) dnsServer = %q", p, cfg.dnsServer)
+		}
+	}
+}
+
+func TestParseBoolUnknownValueLeavesFieldUnchanged(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.dnsProxy = true
+	if got := cfg.set("enable_dns", "garbage"); got != configSetInvalid {
+		t.Fatalf("set(enable_dns) = %v, want configSetInvalid", got)
+	}
+	if !cfg.dnsProxy {
+		t.Fatal("invalid bool value should not flip enable_dns")
+	}
+}
+
+func TestResolveSocks5Default(t *testing.T) {
+	cases := []struct {
+		name           string
+		socks5Addr     string
+		httpProxyAddr  string
+		wantSocks5Addr string
+	}{
+		{name: "no proxy configured", wantSocks5Addr: defaultSocks5Addr},
+		{name: "http proxy only", httpProxyAddr: "127.0.0.1:8080", wantSocks5Addr: ""},
+		{name: "explicit socks5", socks5Addr: "10.0.0.1:1080", wantSocks5Addr: "10.0.0.1:1080"},
+		{name: "both proxies", socks5Addr: "10.0.0.1:1080", httpProxyAddr: "127.0.0.1:8080", wantSocks5Addr: "10.0.0.1:1080"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.socks5Addr = tc.socks5Addr
+			cfg.httpProxyAddr = tc.httpProxyAddr
+			if err := cfg.resolve(); err != nil {
+				t.Fatalf("resolve() error = %v", err)
+			}
+			if cfg.socks5Addr != tc.wantSocks5Addr {
+				t.Fatalf("resolve() socks5Addr = %q, want %q", cfg.socks5Addr, tc.wantSocks5Addr)
+			}
+		})
+	}
+}
+
+func TestResolveDNSUDPToggles(t *testing.T) {
+	cases := []struct {
+		name         string
+		dnsProxy     bool
+		disableDNS   bool
+		udpProxy     bool
+		disableUDP   bool
+		wantErr      bool
+		wantDNSProxy bool
+		wantUDPProxy bool
+	}{
+		{name: "defaults keep both disabled"},
+		{name: "enable dns", dnsProxy: true, wantDNSProxy: true},
+		{name: "enable udp", udpProxy: true, wantUDPProxy: true},
+		{name: "disable dns alone", disableDNS: true},
+		{name: "disable udp alone", disableUDP: true},
+		{name: "conflicting dns flags", dnsProxy: true, disableDNS: true, wantErr: true},
+		{name: "conflicting udp flags", udpProxy: true, disableUDP: true, wantErr: true},
+		{name: "disable dns keeps udp", disableDNS: true, udpProxy: true, wantUDPProxy: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.dnsProxy = tc.dnsProxy
+			cfg.disableDNS = tc.disableDNS
+			cfg.udpProxy = tc.udpProxy
+			cfg.disableUDP = tc.disableUDP
+
+			err := cfg.resolve()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("resolve() error = nil, want an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolve() error = %v", err)
+			}
+			if cfg.dnsProxy != tc.wantDNSProxy {
+				t.Fatalf("resolve() dnsProxy = %v, want %v", cfg.dnsProxy, tc.wantDNSProxy)
+			}
+			if cfg.udpProxy != tc.wantUDPProxy {
+				t.Fatalf("resolve() udpProxy = %v, want %v", cfg.udpProxy, tc.wantUDPProxy)
+			}
+		})
+	}
+}
+
+func TestConfigSetUnknownKey(t *testing.T) {
+	cfg := defaultConfig()
+	if got := cfg.set("typo_key", "true"); got != configSetUnknown {
+		t.Fatalf("set(typo_key) = %v, want configSetUnknown", got)
+	}
+}
+
+func TestFindDefaultConfigPathChecksHomeWhenXDGIsSet(t *testing.T) {
+	xdgDir := t.TempDir()
+	homeDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	t.Setenv("HOME", homeDir)
+
+	homeConfigDir := filepath.Join(homeDir, ".config", "graftcp")
+	if err := os.MkdirAll(homeConfigDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	homeConfig := filepath.Join(homeConfigDir, "graftcp.conf")
+	if err := os.WriteFile(homeConfig, []byte("dns_proxy = true\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := defaultConfig()
+	if got := cfg.findDefaultConfigPath(); got != homeConfig {
+		t.Fatalf("findDefaultConfigPath() = %q, want %q", got, homeConfig)
+	}
+}
+
+func TestFindDefaultConfigPathKeepsMGraftcpFallback(t *testing.T) {
+	xdgDir := t.TempDir()
+	homeDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	t.Setenv("HOME", homeDir)
+
+	homeConfigDir := filepath.Join(homeDir, ".config", "mgraftcp")
+	if err := os.MkdirAll(homeConfigDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	homeConfig := filepath.Join(homeConfigDir, "mgraftcp.conf")
+	if err := os.WriteFile(homeConfig, []byte("dns_proxy = true\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := defaultConfig()
+	if got := cfg.findDefaultConfigPath(); got != homeConfig {
+		t.Fatalf("findDefaultConfigPath() = %q, want %q", got, homeConfig)
+	}
+}

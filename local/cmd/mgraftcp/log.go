@@ -1,13 +1,20 @@
 package main
 
-import "github.com/hmgle/graftcp/local"
+import (
+	"io"
+	"os"
 
-type noopLogger struct{}
+	"github.com/hmgle/graftcp/local"
+)
 
-func (n noopLogger) Debugf(msg string, args ...interface{}) {}
-func (n noopLogger) Infof(msg string, args ...interface{})  {}
-func (n noopLogger) Warnf(msg string, args ...interface{})  {}
-func (n noopLogger) Errorf(msg string, args ...interface{}) {}
-func (n noopLogger) Fatalf(msg string, args ...interface{}) {}
+var appLogger = local.NewStderrLogger()
 
-var _ local.Logger = noopLogger{}
+func openDebugLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, err
+	}
+	appLogger = local.NewLogger(io.MultiWriter(os.Stderr, f))
+	local.SetLogger(appLogger)
+	return f, nil
+}

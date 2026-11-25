@@ -1,6 +1,6 @@
 /*
  * graftcp
- * Copyright (C) 2018, 2020 Hmgle <dustgle@gmail.com>
+ * Copyright (C) 2018, 2020-2026 Hmgle <dustgle@gmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -16,10 +16,12 @@
 #define GRAFTCP_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -31,18 +33,32 @@
 #include <sys/user.h>
 #if defined(__x86_64__)
 #include <sys/reg.h>
-#include <linux/sched.h>
 #elif defined(__arm__)
 #include <asm/ptrace.h>
 #elif defined(__arm64__) || defined(__aarch64__)
 #include <asm/ptrace.h>
 #include <linux/elf.h>
 #endif
+#include <linux/sched.h>
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <assert.h>
 
 #include "uthash.h"
+
+#ifndef SOCK_TYPE_MASK
+#define SOCK_TYPE_MASK 0xf
+#endif
+
+/* Recognize clone3 from newer tracees even with older build headers. */
+#ifndef SYS_clone3
+#ifdef __NR_clone3
+#define SYS_clone3 __NR_clone3
+#elif defined(__i386__) || (defined(__x86_64__) && !defined(__ILP32__)) || \
+      (defined(__arm__) && defined(__ARM_EABI__)) || defined(__aarch64__) || defined(__arm64__)
+#define SYS_clone3 435
+#endif
+#endif
 
 #if defined(__arm__) || defined(__arm64__) || defined(__aarch64__)
 
@@ -54,12 +70,44 @@
 #define SYS_connect __NR_connect
 #endif
 
+#ifndef SYS_sendto
+#define SYS_sendto __NR_sendto
+#endif
+
+#ifndef SYS_sendmsg
+#define SYS_sendmsg __NR_sendmsg
+#endif
+
 #ifndef SYS_close
 #define SYS_close __NR_close
 #endif
 
 #ifndef SYS_clone
 #define SYS_clone __NR_clone
+#endif
+
+#ifndef SYS_dup
+#define SYS_dup __NR_dup
+#endif
+
+#ifndef SYS_dup2
+#ifdef __NR_dup2
+#define SYS_dup2 __NR_dup2
+#endif
+#endif
+
+#ifndef SYS_dup3
+#define SYS_dup3 __NR_dup3
+#endif
+
+#ifndef SYS_fcntl
+#define SYS_fcntl __NR_fcntl
+#endif
+
+#ifndef SYS_fcntl64
+#ifdef __NR_fcntl64
+#define SYS_fcntl64 __NR_fcntl64
+#endif
 #endif
 
 #ifndef SYS_exit
@@ -79,52 +127,78 @@
 #define satosin6(x)  ((struct sockaddr_in6 *) &(x))
 #define SOCKPORT6(x) (satosin6(x)->sin6_port)
 
-#define MIN_CLOSE_MSEC 500
-
-struct socket_info {
-	pid_t pid;
-	int fd;
-	uint64_t magic_fd;
-	int domain;
-	int type;
-	size_t dest_addr_len;
-	char dest_addr[sizeof(struct sockaddr_in6)];
-	struct timeval conn_ti;
-	UT_hash_handle hh;	/* makes this structure hashable */
-};
-
-/* magic fd number */
-#define MAGIC_FD  7777777
-#define MAGIC_NUM 3579
-
-#define FLAG_STARTUP    00002
-#define FLAG_INSYSCALL  00010
+#define FLAG_STARTUP        00002
+#define FLAG_INSYSCALL      00010
+#define FLAG_CREATING_CHILD 00020
 
 #define exiting(pinfp)  ((pinfp)->flags & FLAG_INSYSCALL)
+
+#define TRACKED_SOCKET_INITIAL_CAP 8U
+
+struct udp_socket_state;
+struct socket_table;
+
+struct tracked_socket {
+	int fd;
+	int domain;
+	int type;
+	struct udp_socket_state *udp;
+};
 
 struct proc_info {
 	pid_t pid;
 	int flags;
 	int csn;		/* current syscall number */
-	struct socket_info *cws;	/* current process's writing socket info */
-	UT_hash_handle hh;	/* makes this structure hashable */
+	uint64_t clone_flags;
+	uint64_t creation_seq;
+	struct proc_info *creation_prev;
+	struct proc_info *creation_next;
+	unsigned int fd_args[3];
+	bool waiting_for_parent;
+	bool pending_socket;
+	int pending_socket_domain;
+	int pending_socket_type;
+	bool pending_dup;
+	int pending_dup_oldfd;
+	int pending_dup_newfd;
+	bool pending_dup_fixed;
+	bool pending_dup_cloexec;
+	bool pending_sockaddr_restore;
+	uint32_t pending_udp_token;
+	long sockaddr_restore_addr;
+	size_t sockaddr_restore_len;
+	unsigned char sockaddr_restore[sizeof(struct sockaddr_in6)];
+	struct socket_table *files;
+	UT_hash_handle hh;
 };
 
-void add_socket_info(struct socket_info *s);
-void del_socket_info(struct socket_info *s);
-struct socket_info *find_socket_info(uint64_t magic_fd);
-
-void add_proc_info(struct proc_info *p);
-void del_proc_info(struct proc_info *p);
 struct proc_info *find_proc_info(pid_t pid);
 struct proc_info *alloc_proc_info(pid_t pid);
+void free_proc_info(struct proc_info *p);
+
+int track_socket_fd(struct proc_info *pinfp, int fd, int domain, int type);
+int copy_tracked_socket_fd(struct proc_info *dst, const struct proc_info *src,
+			   int oldfd, int newfd);
+int copy_tracked_sockets(struct proc_info *dst, const struct proc_info *src);
+void share_tracked_sockets(struct proc_info *dst, const struct proc_info *src);
+int unshare_tracked_sockets(struct proc_info *pinfp);
+void set_socket_cloexec(struct proc_info *pinfp, int fd, bool enabled);
+void close_tracked_range(struct proc_info *pinfp, unsigned int first,
+			 unsigned int last, bool cloexec);
+void close_exec_sockets(struct proc_info *pinfp);
+bool is_tracked_socket_fd(struct proc_info *pinfp, int fd);
+bool is_tracked_stream_socket_fd(struct proc_info *pinfp, int fd);
+bool is_tracked_dgram_socket_fd(struct proc_info *pinfp, int fd);
+void untrack_socket_fd(struct proc_info *pinfp, int fd);
+void mark_socket_may_cork(struct proc_info *pinfp, int fd);
+bool socket_may_cork(struct proc_info *pinfp, int fd);
 
 int get_syscall_number(pid_t pid);
 int get_retval(pid_t pid);
 void set_retval(pid_t pid, long new_val);
 long get_syscall_arg(pid_t pid, int order);
 
-void getdata(pid_t child, long addr, char *dst, int len);
-void putdata(pid_t child, long addr, char *src, int len);
+int getdata(pid_t child, long addr, void *dst, size_t len);
+int putdata(pid_t child, long addr, const void *src, size_t len);
 
 #endif
